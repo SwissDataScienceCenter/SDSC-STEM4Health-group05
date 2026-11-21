@@ -1,0 +1,3 @@
+,accuracy,precision,recall,f1,balanced_accuracy,auc,false_alarms
+A,0.8273,0.7186,0.5,0.5891,0.7178,0.8535,0.0645
+B,0.8875,0.5441,1.0,0.6987,0.9357,1.0,0.1286
