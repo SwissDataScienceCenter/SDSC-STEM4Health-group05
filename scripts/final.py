@@ -16,12 +16,18 @@ PROCESS A - selected by `--compare` (see A_MODEL below)
                     extra-trees probability (how much like the known rejects)
                   cut-off tuned to maximise the leaderboard F1.
   pca_or_ensemble rejected if pca_limit OR ensemble_tuned rejects ("in doubt, reject").
-                  SELECTED: best validated F1 (0.908 vs 0.891 for pca_limit).
+                  Leaderboard F1 0.934 (2nd submission).
+  lw95_or_weighted same OR rule, PCA replaced by a Ledoit-Wolf (shrunk-covariance) Mahalanobis
+                  distance on mean/std of good batches, 95% limit from unseen good batches.
+                  Ensemble = 30% Ledoit-Wolf + 70% extra-trees percentile; cut-off = median of
+                  the top-5 F1 cut-offs (SmoothedCutoff) instead of the single best.
+                  SELECTED: leaderboard F1 0.943 (score 0.972).
 
-PROCESS B - logistic regression (unchanged; scored 1.0 on the leaderboard)
+PROCESS B - logistic regression (scored 1.0 on the leaderboard)
   Features per sensor: mean, std, median, 5th/95th percentile, robust noise, relative
   step (largest jump within the batch / the batch's own level), plus batch length.
-  Cut-off: maximise F2 (recall of rejects counts double) on out-of-sample probabilities.
+  Cut-off: maximise the leaderboard F1 ('accepted' = positive) on out-of-sample probabilities,
+  the same objective as A (until 2026-11-22: F2 on rejects; same test predictions).
 
 TUNED CUT-OFFS are always chosen on out-of-sample scores of the training batches
 (inner 5-fold CV), never on the batches being judged.
@@ -54,6 +60,7 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+from sklearn.covariance import LedoitWolf
 from sklearn.decomposition import PCA
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.linear_model import LogisticRegression
@@ -65,9 +72,13 @@ CV_REPEATS = {"A": 5, "B": 10}
 # chosen with --compare (validated leaderboard F1 for A): pca_limit 0.891, pca_tuned 0.886,
 # ensemble_tuned 0.906, pca_or_ensemble 0.908 -> pca_or_ensemble
 # (it also keeps every rejection of pca_limit, whose rejections the leaderboard confirmed as ~91% correct)
-A_MODEL = "pca_or_ensemble"
+# 2026-11-22: lw95_or_weighted scored 0.943 on the leaderboard (pca_or_ensemble 0.934) -> selected
+A_MODEL = "lw95_or_weighted"
 if "--a-model" in sys.argv:  # override from the command line, e.g. --a-model pca_limit
     A_MODEL = sys.argv[sys.argv.index("--a-model") + 1]
+PCA_VARIANCE = 0.975  # share of variance kept by every PCA (was 0.90 until 2026-11-22)
+if "--pca-var" in sys.argv:  # override, e.g. --pca-var 0.90
+    PCA_VARIANCE = float(sys.argv[sys.argv.index("--pca-var") + 1])
 
 
 # ============================================================================ paths
@@ -143,14 +154,15 @@ def robust_scale_params(X_good):
 class PCAScorer:
     """Baseline PCA on good batches. Score = max(T2/limit, Q/limit); above 1 = beyond a 95% limit."""
 
-    def __init__(self, cols=None):
+    def __init__(self, cols=None, limit_pct=95):
         self.cols = cols  # column indices to use (None = all)
+        self.limit_pct = limit_pct  # control limit: % of unseen good batches that stay under it
 
     def _learn(self, X_good):
         self.mean = X_good.mean(0)
         std = X_good.std(0)
         self.std = np.where(std > 0, std, 1.0)
-        self.pca = PCA(n_components=0.90, svd_solver="full").fit((X_good - self.mean) / self.std)
+        self.pca = PCA(n_components=PCA_VARIANCE, svd_solver="full").fit((X_good - self.mean) / self.std)
         return self
 
     def _t2_q(self, X):
@@ -165,12 +177,43 @@ class PCAScorer:
         t2, q = np.zeros(len(X_good)), np.zeros(len(X_good))
         for a, b in KFold(5, shuffle=True, random_state=SEED).split(X_good):
             t2[b], q[b] = PCAScorer()._learn(X_good[a])._t2_q(X_good[b])
-        self.t2_limit, self.q_limit = np.percentile(t2, 95), np.percentile(q, 95)
+        self.t2_limit, self.q_limit = np.percentile(t2, self.limit_pct), np.percentile(q, self.limit_pct)
         return self
 
     def score(self, X):
         t2, q = self._t2_q(X if self.cols is None else X[:, self.cols])
         return np.maximum(t2 / self.t2_limit, q / self.q_limit)
+
+
+class LedoitWolfScorer:
+    """Mahalanobis distance to the good batches with a Ledoit-Wolf shrunk covariance (stable with
+    few good batches). Score = distance / its 95% limit on unseen good batches; above 1 = beyond."""
+
+    def __init__(self, cols=None, limit_pct=95):
+        self.cols, self.limit_pct = cols, limit_pct
+
+    def _learn(self, X_good):
+        self.mean = X_good.mean(0)
+        std = X_good.std(0)
+        self.std = np.where(std > 1e-12, std, 1.0)
+        self.lw = LedoitWolf().fit(np.clip((X_good - self.mean) / self.std, -50, 50))
+        return self
+
+    def _dist(self, X):
+        return self.lw.mahalanobis(np.clip((X - self.mean) / self.std, -50, 50))
+
+    def fit(self, X, y):
+        X = X if self.cols is None else X[:, self.cols]
+        X_good = X[y == 0]
+        self._learn(X_good)
+        d = np.zeros(len(X_good))
+        for a, b in KFold(5, shuffle=True, random_state=SEED).split(X_good):
+            d[b] = LedoitWolfScorer()._learn(X_good[a])._dist(X_good[b])
+        self.limit = np.percentile(d, self.limit_pct) + 1e-12
+        return self
+
+    def score(self, X):
+        return self._dist(X if self.cols is None else X[:, self.cols]) / self.limit
 
 
 class ClassifierScorer:
@@ -191,11 +234,11 @@ class ClassifierScorer:
 
 
 class EnsembleScorer:
-    """Average percentile of several scorers. Percentiles are relative to out-of-sample scores
-    of the training batches, so the scorers are on the same scale."""
+    """(Weighted) average percentile of several scorers. Percentiles are relative to out-of-sample
+    scores of the training batches, so the scorers are on the same scale."""
 
-    def __init__(self, makers):
-        self.makers = makers
+    def __init__(self, makers, weights=None):
+        self.makers, self.weights = makers, weights
 
     def fit(self, X, y):
         self.refs, self.models = [], []
@@ -208,8 +251,8 @@ class EnsembleScorer:
         return self
 
     def score(self, X):
-        return np.mean([np.searchsorted(r, m.score(X), side="right") / len(r)
-                        for r, m in zip(self.refs, self.models)], axis=0)
+        return np.average([np.searchsorted(r, m.score(X), side="right") / len(r)
+                           for r, m in zip(self.refs, self.models)], axis=0, weights=self.weights)
 
 
 # ============================================================================ decision rules
@@ -259,6 +302,41 @@ class TunedCutoff:
         return (self.scorer.score(X) >= self.cutoff).astype(int)
 
 
+class SmoothedCutoff(TunedCutoff):
+    """Like TunedCutoff, but the cut-off is the median of the top-k cut-offs (less overfitting
+    to one noisy peak on small data)."""
+
+    def __init__(self, make_scorer, objective, top_k=5):
+        super().__init__(make_scorer, objective)
+        self.top_k = top_k
+
+    def fit(self, X, y):
+        oof = np.zeros(len(y))
+        for a, b in StratifiedKFold(5, shuffle=True, random_state=SEED).split(X, y):
+            oof[b] = self.make_scorer().fit(X[a], y[a]).score(X[b])
+        ts = np.unique(oof)
+        scores = np.array([self.objective(y, (oof >= t).astype(int)) for t in ts])
+        self.cutoff = np.median(ts[np.argsort(scores)[-self.top_k:]])
+        self.scorer = self.make_scorer().fit(X, y)
+        return self
+
+
+class PcaFirstScorer:
+    """Score for the OR rule with a jointly tuned cut-off: batches beyond the PCA's 95% limit get
+    score 2 (always rejected, above any cut-off); all others keep the ensemble percentile (0-1).
+    A TunedCutoff on this score therefore tunes the ensemble cut-off FOR the combined decision."""
+
+    def __init__(self, make_pca, make_ensemble):
+        self.make_pca, self.make_ensemble = make_pca, make_ensemble
+
+    def fit(self, X, y):
+        self.pca, self.ens = self.make_pca().fit(X, y), self.make_ensemble().fit(X, y)
+        return self
+
+    def score(self, X):
+        return np.where(self.pca.score(X) > 1, 2.0, self.ens.score(X))
+
+
 class EitherRejects:
     """Two-opinion rule: rejected if ANY of the models rejects ("in doubt, reject")."""
 
@@ -300,8 +378,17 @@ A_CANDIDATES = {
     "pca_or_ensemble": (features_all, lambda cols: EitherRejects([
         lambda: FixedLimit(lambda: PCAScorer(basic_cols(cols))),
         lambda: make_ensemble_tuned(cols)])),
+    "pca_or_ensemble_joint": (features_all, lambda cols: TunedCutoff(lambda: PcaFirstScorer(
+        lambda: PCAScorer(basic_cols(cols)),
+        lambda: EnsembleScorer([lambda: PCAScorer(basic_cols(cols)),
+                                lambda: ClassifierScorer(make_extratrees)])), leaderboard_f1)),
+    "lw95_or_weighted": (features_all, lambda cols: EitherRejects([
+        lambda: FixedLimit(lambda: LedoitWolfScorer(basic_cols(cols), 95)),
+        lambda: SmoothedCutoff(lambda: EnsembleScorer(
+            [lambda: LedoitWolfScorer(basic_cols(cols), 95), lambda: ClassifierScorer(make_extratrees)],
+            weights=[0.3, 0.7]), leaderboard_f1)])),
 }
-B_MODEL = (features_all, lambda cols: TunedCutoff(lambda: ClassifierScorer(make_logreg), f2_rejected))
+B_MODEL = (features_all, lambda cols: TunedCutoff(lambda: ClassifierScorer(make_logreg), leaderboard_f1))
 
 
 # ============================================================================ validation
@@ -374,7 +461,7 @@ def save_history(submission, summary, score):
     submission.to_csv(hist_dir / name, index=False)
     rejected = submission[submission.label == "rejected"].groupby("project").size()
     row = pd.DataFrame([dict(
-        timestamp=stamp, a_model=A_MODEL, b_model="logreg_f2",
+        timestamp=stamp, a_model=A_MODEL, b_model="logreg_f1",
         validated_f1_a=round(summary["A"].f1, 4), validated_f1_b=round(summary["B"].f1, 4),
         validated_score=round(score, 4),
         rejected_a=int(rejected.get("A", 0)), rejected_b=int(rejected.get("B", 0)),
@@ -388,7 +475,7 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     predictions, summary = [], {}
     models = {"A": A_CANDIDATES[A_MODEL], "B": B_MODEL}
-    names = {"A": A_MODEL, "B": "logistic regression, F2 cut-off"}
+    names = {"A": A_MODEL, "B": "logistic regression, F1 cut-off"}
 
     for p, (make_features, make_model) in models.items():
         F_cal, F_test, y, labels = prepare(p, make_features)
